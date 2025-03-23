@@ -99,7 +99,6 @@ async fn main(spawner: Spawner) {
         .with_cs(slave_cs2)
         .with_dma(dma_channel, rx_descriptors, tx_descriptors);
 
-    let delay = Delay::new();
 
     // DMA buffer require a static life-time
 
