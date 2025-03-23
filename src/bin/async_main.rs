@@ -66,9 +66,6 @@ static SIGNAL: Watch<CriticalSectionRawMutex, bool, 6> = Watch::new();
 static CS_PIN: critical_section::Mutex<RefCell<Option<Input>>> =
     critical_section::Mutex::new(RefCell::new(None));
 
-static DMA_BUFFER: embassy_sync::mutex::Mutex<CriticalSectionRawMutex, Option<[u8; 2048]>> =
-    embassy_sync::mutex::Mutex::new(None);
-
 #[esp_hal_embassy::main]
 async fn main(spawner: Spawner) {
     // Initialize the peripherals
@@ -127,27 +124,6 @@ async fn background_task() {
     loop {
         wait_transfer.changed().await; // async await for spi slave to have a transaction
         println!("Background task: SPI transaction finished");
-        // Do something with the data received
-        // Do something with the data received
-        let buffer_guard = DMA_BUFFER.lock().await;
-        if let Some(ref buffer) = *buffer_guard {
-            // Process the data as 512-float chunks
-            let offset = DMA_HEAD.load(Ordering::SeqCst);
-            // Find any bytes equal to 0xFF and log their positions
-            println!("Searching for 0xFF bytes in the current chunk...");
-            for (i, &byte) in buffer.iter().enumerate() {
-                if byte == 0xFF {
-                    println!("Found 0xFF at index {} (the offset is: {})", i, offset);
-                }
-            }
-
-            println!(
-                "recv stuff {:x?} .. {:x?}",
-                &buffer[..10],
-                &buffer[buffer.len() - 10..],
-            );
-            
-        }
     }
 }
 
@@ -163,12 +139,7 @@ async fn slave_spi_routine(
     // Initialize the SPI
     // put zero in the tx buffer because slave doesn't send data (just receives)
     // choose a buffer size that is a multiple of 4 bytes
-    let (rx_buffer, rx_descriptors, _, tx_descriptors) = dma_circular_buffers!(2048, 0);
-
-    {
-        let mut buffer = DMA_BUFFER.lock().await;
-        *buffer = Some(*rx_buffer);
-    }
+    let (rx_buffer, rx_descriptors, _, tx_descriptors) = dma_buffers!(4, 0);
 
     let mut spi = spi::slave::Spi::new(spi_chan, spi::Mode::_0)
         .with_sck(slave_sclk)
@@ -178,6 +149,7 @@ async fn slave_spi_routine(
         .with_dma(dma_channel, rx_descriptors, tx_descriptors);
 
     let mut recv = SIGNAL.receiver().unwrap();
+
     loop {
         let mut transfer = spi.read(rx_buffer).unwrap();
         recv.changed().await;
@@ -189,6 +161,22 @@ async fn slave_spi_routine(
             Timer::after(Duration::from_millis(10)).await; // just some little delay so it allows the transfer to finish and other routines to go on
         }
         drop(transfer);
+
+        let offset = DMA_HEAD.load(Ordering::SeqCst);
+        // Find any bytes equal to 0xFF and log their positions
+        println!("Searching for 0xFF bytes in the current chunk...");
+        for (i, &byte) in rx_buffer.iter().enumerate() {
+            if byte == 0xFF {
+                println!("Found 0xFF at index {} (offset is: {})", i, offset);
+            }
+        }
+
+        // println!(
+        //     "recv stuff {:x?} .. {:x?}",
+        //     &rx_buffer[..10],
+        //     &rx_buffer[rx_buffer.len() - 10..],
+        // );
+        println!("recv stuff {:x?}", &rx_buffer[..]);
     }
 }
 
