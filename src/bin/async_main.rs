@@ -1,12 +1,42 @@
-//! SPI slave device implementation using DMA.
+
+//! ## Architecture
 //!
-//! Hardware connections for ESP32 SPI slave:
-//! - SCLK => GPIO10
-//! - MISO => GPIO11
-//! - MOSI => GPIO12
-//! - CS   => GPIO13
+//! ### Core Components
+//! 1. **SPI Slave Interface**: Receives data via SPI using DMA for efficient transfers
+//! 2. **Circular Buffer**: Acts as an intermediate store between SPI reception and data processing
+//! 3. **Asynchronous Tasks**: Separate tasks handle SPI communication and data processing
+//! 4. **Interrupt Handling**: CS pin rising edge triggers transaction completion
+//! 
 //!
+//! ### Main Tasks
+//! 1. **spi_slave_task**: Handles SPI communication and transfers data to the circular buffer
+//! 2. **data_processing_task**: Dummy Processes receive data and displayss some statistics
+//!
+//! ### Synchronization Mechanisms
+//! - **SPI_TRANSACTION_END**: Notifies when a SPI transaction completes
+//! - **DATA_UPDATED_ON_RINGBUFF**: Signals when new data is available in the circular buffer
+//! - **CS_PIN**: Manages CS pin state for interrupt handling
+//!
+//! ## Key Functions
+//!
+//! ### Buffer Management Functions
+//! - `init_circular_buffer()`: Initializes the circular buffer
+//! - `push_to_buffer()`: Adds new data to the front of the buffer
+//! - `pop_latest_from_buffer()`: Retrieves the newest data
+//! - `pop_oldest_from_buffer()`: Retrieves the oldest data
+//! - `is_buffer_empty()`: Checks if the buffer contains any data
+//!
+//! ### Main Task Functions
+//! - `spi_slave_task()`: Configures SPI in slave mode with DMA and handles data reception
+//! - `data_processing_task()`: Processes received data and calculates performance metrics
+//! - `handler()`: Interrupt handler for CS pin to detect transaction completion
+
+//! ## Minimal Example:
 //! This example receives data via SPI in slave mode and processes it in a background task using async.
+//! The application tracks and displays in the serial console the following about the data received from SPI:
+//! - Total data received
+//! - Data transfer rate in bytes per second
+//! - Very minimal data integrity verification
 //! The circular buffer allows handling (processing) data at different rates than it's received.
 
 //% FEATURES: esp-hal/unstable
@@ -55,7 +85,14 @@ fn init_circular_buffer() {
             .replace(CircularBuffer::<CIRCULAR_BUFFER_SIZE, [u8; CHUNK_SIZE]>::new());
     });
 }
-
+/// Adds a new data chunk to the front (newest position) of the circular buffer.
+///
+/// # Parameters
+/// * `value` - The data chunk (byte array) to add to the buffer
+///
+/// # Returns
+/// * `Ok(())` - If the data was successfully added to the buffer
+/// * `Err(())` - If the buffer hasn't been initialized
 fn push_to_buffer(value: [u8; CHUNK_SIZE]) -> Result<(), ()> {
     critical_section::with(|cs| {
         if let Some(buf) = CIRCULAR_BUFFER.borrow_ref_mut(cs).as_mut() {
@@ -66,7 +103,11 @@ fn push_to_buffer(value: [u8; CHUNK_SIZE]) -> Result<(), ()> {
         }
     })
 }
-
+/// Retrieves and removes the newest data chunk from the circular buffer.
+///
+/// # Returns
+/// * `Some([u8; CHUNK_SIZE])` - The newest data chunk if the buffer is not empty
+/// * `None` - If the buffer is empty or hasn't been initialized
 fn pop_latest_from_buffer() -> Option<[u8; CHUNK_SIZE]> {
     critical_section::with(|cs| {
         CIRCULAR_BUFFER
@@ -76,6 +117,11 @@ fn pop_latest_from_buffer() -> Option<[u8; CHUNK_SIZE]> {
     })
 }
 
+/// Retrieves and removes the oldest data chunk from the circular buffer.
+///
+/// # Returns
+/// * `Some([u8; CHUNK_SIZE])` - The oldest data chunk if the buffer is not empty
+/// * `None` - If the buffer is empty or hasn't been initialized
 fn pop_oldest_from_buffer() -> Option<[u8; CHUNK_SIZE]> {
     critical_section::with(|cs| {
         CIRCULAR_BUFFER
@@ -84,7 +130,11 @@ fn pop_oldest_from_buffer() -> Option<[u8; CHUNK_SIZE]> {
             .and_then(|buf| buf.pop_back())
     })
 }
-
+/// Checks if the circular buffer is empty.
+///
+/// # Returns
+/// * `true` - If the buffer is empty or hasn't been initialized
+/// * `false` - If the buffer contains at least one data chunk
 fn is_buffer_empty() -> bool {
     critical_section::with(|cs| {
         CIRCULAR_BUFFER
@@ -115,7 +165,7 @@ async fn main(spawner: Spawner) {
     let slave_miso = Output::new(peripherals.GPIO11, Level::Low, config_out);
     let slave_mosi = Input::new(peripherals.GPIO12, config_in);
     let mut slave_cs_clone = Input::new(
-        unsafe { peripherals.GPIO13.clone_unchecked() }, // since we are gonna access it from the interrupt and inside critical section concurrent access is not possible
+        unsafe { peripherals.GPIO13.clone_unchecked() }, // since we are gonna access it from the interrupt and inside critical section concurrent will not happen
         config_in,
     );
     let slave_cs = Input::new(peripherals.GPIO13, config_in);
@@ -137,7 +187,7 @@ async fn main(spawner: Spawner) {
             slave_miso,
             slave_mosi,
             peripherals.DMA_CH0,
-            peripherals.SPI2,
+            peripherals.SPI2,// of course you can use any SPI peripheral channel
         ))
         .unwrap();
     // Spawn example data processing task
@@ -150,7 +200,7 @@ async fn main(spawner: Spawner) {
     }
 }
 
-// Data processing task -> Dummy example, right now it is just checking the data integrity and printing the data rate statistics
+// Data processing task -> Dummy example, right now it is just checking the simple data integrity and printing the data rate statistics
 // This task runs in the background and processes data received via the CIRC buffer
 #[embassy_executor::task]
 async fn data_processing_task() {
@@ -220,12 +270,24 @@ async fn data_processing_task() {
     }
 }
 
-// SPI slave task - handles SPI communication in the background
-// uploads data to the circular buffer when received after the interrupt happens and the data is read in the dma buffer
-// after the data is pushed to the circular buffer it sends a notification to the data processing task via the waker channel
-// you could even make it so the data ready channel already send the CHUNK with it (then circ buffer not is really necessary), but this is up to implementation details
-// To know if it the transaction is done we check the waker channel that is triggered by the CS pin rising edge Interrupt
-
+/// SPI slave task that handles background SPI communication.
+///
+/// After receiving data via SPI DMA:
+/// 1. Waits for CS pin rising edge interrupt to detect transaction completion
+/// 2. Uploads received data to the circular buffer when it receives a notification from waker channel
+/// 3. Notifies the data processing task via the waker channel
+///
+/// Note: As an alternative implementation, the data ready channel could 
+/// directly send the data chunk, potentially eliminating the need for 
+/// the circular buffer.
+///
+/// # Parameters
+/// * `slave_cs` - Chip Select input pin
+/// * `slave_sclk` - Clock input pin
+/// * `slave_miso` - Master In Slave Out output pin
+/// * `slave_mosi` - Master Out Slave In input pin
+/// * `dma_channel` - DMA channel for data transfer
+/// * `spi_chan` - SPI peripheral
 #[embassy_executor::task]
 async fn spi_slave_task(
     slave_cs: Input<'static>,
@@ -233,7 +295,7 @@ async fn spi_slave_task(
     slave_miso: Output<'static>,
     slave_mosi: Input<'static>,
     dma_channel: esp_hal::dma::DmaChannel0,
-    spi_chan: esp_hal::peripherals::SPI2,
+    spi_chan: esp_hal::peripherals::SPI2,// of course you can use any SPI peripheral channel
 ) {
     // Create DMA buffers for SPI transfers
     let (rx_buffer, rx_descriptors, _, tx_descriptors) = dma_buffers!(DMA_BUFFER_SIZE, 0);
