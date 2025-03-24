@@ -223,8 +223,7 @@ async fn data_processing_task() {
                 continue;
             }
         };
-
-        // Check data markers
+        // Check data markers made by the master
         if buffer[2] != 0xFF {
             if buffer[2] == 0xED {
                 // Statistics marker - display performance data
@@ -239,7 +238,7 @@ async fn data_processing_task() {
                     if everything_was_valid {
                         "Valid"
                     } else {
-                        "Errors detected"
+                        "Errors detected, marker was not right"
                     }
                 );
 
