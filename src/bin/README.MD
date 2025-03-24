@@ -4,7 +4,7 @@
 This project demonstrates how to use an ESP32 as an SPI slave device with DMA (Direct Memory Access). It receives data from an SPI master device and makes it available asynchronously in a ring buffer using Embassy and no_std environment.
 
 ## Features
-- SPI slave implementation with DMA buffer, receives chunks `CHUNK_SIZE` of data each time.
+- SPI slave implementation with DMA buffer, receives chunks with `CHUNK_SIZE` batches of data each time.
 - Interrupt-driven approach using CS pin for transaction end detection
 - Circular buffer allows different speeds between receiving data and processing data
 - Nearly everything is asynchronous with separate tasks and waker channels for notifications
