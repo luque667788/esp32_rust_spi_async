@@ -32,7 +32,7 @@
 
 use embassy_executor::Spawner;
 use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, watch::Watch};
-use embassy_time::{Duration, Timer};
+use embassy_time::{Duration, Instant, Timer};
 use esp_backtrace as _;
 use esp_hal::{
     dma_circular_buffers,
@@ -53,18 +53,70 @@ use esp_hal::{
 use esp_println::println;
 
 use core::cell::RefCell;
-const CHUNK_SIZE: usize = 512 * 4;
+const CHUNK_SIZE: usize = 512 * 4; //
+const DMA_BUFFER_SIZE: usize = CHUNK_SIZE; // Size of the DMA buffer i making it equal to the chunk size (make sure it is always multiple of 4 bytes)
+const CIRCULAR_BUFFER_SIZE: usize = 40; // Size of the circular buffer
 
-// Use AtomicUsize for integers that need to be safely modified across threads or interrupts
-use core::sync::atomic::{AtomicUsize, Ordering};
-
-// Define DMA_HEAD as an atomic
-static DMA_HEAD: AtomicUsize = AtomicUsize::new(0);
-static DMA_TAIL: AtomicUsize = AtomicUsize::new(0);
-
-static SIGNAL: Watch<CriticalSectionRawMutex, bool, 6> = Watch::new();
+static SPI_TRANSACTION_END: Watch<CriticalSectionRawMutex, bool, 6> = Watch::new(); // be free to change the number of channel consummers according to your needs
+static DATA_UPDATED_ON_RINGBUFF: Watch<CriticalSectionRawMutex, bool, 6> = Watch::new(); // be free to change the number of channel consummers according to your needs
 static CS_PIN: critical_section::Mutex<RefCell<Option<Input>>> =
     critical_section::Mutex::new(RefCell::new(None));
+
+use circular_buffer::CircularBuffer;
+
+// Thread-safe circular buffer
+static CIRCULAR_BUFFER: critical_section::Mutex<
+    RefCell<Option<CircularBuffer<CIRCULAR_BUFFER_SIZE, [u8; CHUNK_SIZE]>>>,
+> = critical_section::Mutex::new(RefCell::new(None));
+
+// Initialize the buffer in main
+fn init_circular_buffer() {
+    critical_section::with(|cs| {
+        CIRCULAR_BUFFER
+            .borrow_ref_mut(cs)
+            .replace(CircularBuffer::<CIRCULAR_BUFFER_SIZE, [u8; CHUNK_SIZE]>::new());
+    });
+}
+
+// Helper functions to safely access the buffer
+fn push_to_buffer(value: [u8; CHUNK_SIZE]) -> Result<(), ()> {
+    critical_section::with(|cs| {
+        if let Some(buf) = CIRCULAR_BUFFER.borrow_ref_mut(cs).as_mut() {
+            buf.push_front(value);
+            Ok(())
+        } else {
+            Err(())
+        }
+    })
+}
+// get latest value from the buffer
+fn pop_latest_from_buffer() -> Option<[u8; CHUNK_SIZE]> {
+    critical_section::with(|cs| {
+        CIRCULAR_BUFFER
+            .borrow_ref_mut(cs)
+            .as_mut()
+            .and_then(|buf| buf.pop_front())
+    })
+}
+// get oldest value from the buffer
+fn pop_oldest_from_buffer() -> Option<[u8; CHUNK_SIZE]> {
+    critical_section::with(|cs| {
+        CIRCULAR_BUFFER
+            .borrow_ref_mut(cs)
+            .as_mut()
+            .and_then(|buf| buf.pop_back())
+    })
+}
+
+// check if the buffer is empty
+fn is_buffer_empty() -> bool {
+    critical_section::with(|cs| {
+        CIRCULAR_BUFFER
+            .borrow_ref_mut(cs)
+            .as_mut()
+            .map_or(true, |buf| buf.is_empty())
+    })
+}
 
 #[esp_hal_embassy::main]
 async fn main(spawner: Spawner) {
@@ -95,7 +147,10 @@ async fn main(spawner: Spawner) {
         slave_cs_clone.listen(Event::RisingEdge);
         CS_PIN.borrow_ref_mut(cs).replace(slave_cs_clone);
     });
+    // Initialize the circular buffer
+    init_circular_buffer();
 
+    // Initialize the SPI and DMA
     spawner
         .spawn(slave_spi_routine(
             slave_cs,
@@ -106,6 +161,8 @@ async fn main(spawner: Spawner) {
             peripherals.SPI2,
         ))
         .unwrap();
+
+    // Background task that "works" on the data
     spawner.spawn(background_task()).unwrap();
 
     loop {
@@ -118,12 +175,58 @@ async fn main(spawner: Spawner) {
 
 #[embassy_executor::task]
 async fn background_task() {
-    let mut wait_transfer = SIGNAL.receiver().unwrap(); // ge the wait handle for spi transaction finished
+    let mut wait_new_data = DATA_UPDATED_ON_RINGBUFF.receiver().unwrap(); // ge the wait handle for spi transaction finished
+                                                                          // we can also use different types of channels if you like or even send the data over the channel instead of putting in the buffer
+                                                                          // but this is a simple example
 
     // This task is just a placeholder for the background task
+    // if the background task cannot handle the speed the data is sent the data will be stored in the circular buffer (right now it fits 40 times the CHUNK_SIZE)
+    let mut total_data_recv = 0;
+    let mut start_time = Instant::now();
+    let mut everything_was_valid = true;
     loop {
-        wait_transfer.changed().await; // async await for spi slave to have a transaction
-        println!("Background task: SPI transaction finished");
+        wait_new_data.changed().await; // async await for spi slave to have a transaction
+                                       //println!("Background task: GOT new data in the buffer to display");
+        let buff = match pop_latest_from_buffer() {
+            Some(buffer) => buffer,
+            None => {
+                println!("No data available in buffer");
+                continue; // Skip the rest of this iteration
+            }
+        };
+        if buff[2] != 0xFF {
+            if buff[2] == 0xED {
+                // marker to display the statistics data
+                let data_rate =
+                    total_data_recv as f64 / (start_time.elapsed().as_millis() as f64 / 1000.0);
+                println!("Total data received: {} bytes", total_data_recv);
+                println!("Data rate: {:.2} bytes/second", data_rate);
+
+                start_time = Instant::now(); // Reset start time
+                total_data_recv = 0; // Reset total data sent
+
+                if everything_was_valid {
+                    println!("Everything was valid");
+                } else {
+                    println!("Something was wrong with the data");
+                }
+                everything_was_valid = true;
+            } else {
+                everything_was_valid = false;
+            }
+        }
+
+        total_data_recv += buff.len(); // update the total data received
+
+        // if buff.len() > 20 {
+        //     println!(
+        //         "stuff in the buffer {:x?} .. {:x?}",
+        //         &buff[..10],
+        //         &buff[buff.len() - 10..],
+        //     );
+        // } else {
+        //     println!("stuff in the buffer {:x?}", &buff[..]);
+        // }
     }
 }
 
@@ -139,7 +242,7 @@ async fn slave_spi_routine(
     // Initialize the SPI
     // put zero in the tx buffer because slave doesn't send data (just receives)
     // choose a buffer size that is a multiple of 4 bytes
-    let (rx_buffer, rx_descriptors, _, tx_descriptors) = dma_buffers!(4, 0);
+    let (rx_buffer, rx_descriptors, _, tx_descriptors) = dma_buffers!(DMA_BUFFER_SIZE, 0);
 
     let mut spi = spi::slave::Spi::new(spi_chan, spi::Mode::_0)
         .with_sck(slave_sclk)
@@ -148,35 +251,23 @@ async fn slave_spi_routine(
         .with_cs(slave_cs)
         .with_dma(dma_channel, rx_descriptors, tx_descriptors);
 
-    let mut recv = SIGNAL.receiver().unwrap();
-
+    let mut spi_transaction_end_recv = SPI_TRANSACTION_END.receiver().unwrap();
+    let data_ready_send = DATA_UPDATED_ON_RINGBUFF.sender();
     loop {
         let mut transfer = spi.read(rx_buffer).unwrap();
-        recv.changed().await;
-        println!("SPI GOT data in SLAVE");
+        spi_transaction_end_recv.changed().await;
+        //println!("SPI GOT data in SLAVE");
 
         while !transfer.is_done() {
             // Wait for the transfer to complete
-            println!("just waiting for dma transfer to finish, the spi transaction was already ");
+            //println!("just waiting for dma transfer to finish, the spi transaction was already ");
             Timer::after(Duration::from_millis(10)).await; // just some little delay so it allows the transfer to finish and other routines to go on
         }
         drop(transfer);
 
-        let offset = DMA_HEAD.load(Ordering::SeqCst);
-        // Find any bytes equal to 0xFF and log their positions
-        println!("Searching for 0xFF bytes in the current chunk...");
-        for (i, &byte) in rx_buffer.iter().enumerate() {
-            if byte == 0xFF {
-                println!("Found 0xFF at index {} (offset is: {})", i, offset);
-            }
-        }
-
-        // println!(
-        //     "recv stuff {:x?} .. {:x?}",
-        //     &rx_buffer[..10],
-        //     &rx_buffer[rx_buffer.len() - 10..],
-        // );
-        println!("recv stuff {:x?}", &rx_buffer[..]);
+        push_to_buffer(*rx_buffer).expect("Failed to push data to circular buffer"); // push the received data to the circular buffer
+        data_ready_send.send(true); // send signal that data is ready
+                                    //println!("Pushed data to circular buffer");
     }
 }
 
@@ -193,28 +284,7 @@ fn handler() {
     }) {
         // interrupt was triggered by the CS pin rising edge, firing channel
         // Update the head position with wrapping add
-        {
-            // Use atomic operations instead of direct mutation
-            let current_head = DMA_HEAD.load(Ordering::SeqCst);
-            let new_head = (current_head + CHUNK_SIZE) % 32000;
-            DMA_HEAD.store(new_head, Ordering::SeqCst);
-
-            // Update tail to follow head, maintaining proper distance
-            let current_tail = DMA_TAIL.load(Ordering::SeqCst);
-
-            if new_head > current_tail && new_head - current_tail > 3 * CHUNK_SIZE {
-                // If head is ahead by more than 3 chunks, move tail forward
-                DMA_TAIL.store(new_head - 3 * CHUNK_SIZE, Ordering::SeqCst);
-            } else if new_head < current_tail && (32000 - current_tail + new_head) > 3 * CHUNK_SIZE
-            {
-                // Handle wrap-around case
-                DMA_TAIL.store(
-                    (new_head + 32000 - 3 * CHUNK_SIZE) % 32000,
-                    Ordering::SeqCst,
-                );
-            }
-        }
-        let sender = SIGNAL.sender();
+        let sender = SPI_TRANSACTION_END.sender();
         sender.send(true);
     } else {
         esp_println::println!("Button was not the source of the interrupt");
@@ -227,34 +297,4 @@ fn handler() {
             .unwrap()
             .clear_interrupt()
     });
-}
-
-// Helper function to convert bytes to floats and process them
-fn process_float_chunk(chunk_bytes: &[u8]) {
-    // Make sure we have enough bytes for 512 floats
-    if chunk_bytes.len() != 512 * 4 {
-        println!("Unexpected chunk size: {} bytes", chunk_bytes.len());
-        return;
-    }
-
-    // Create a buffer to hold the floats
-    let mut floats = [0.0f32; 512];
-
-    // Convert bytes to floats (assuming little-endian)
-    for i in 0..512 {
-        let bytes = [
-            chunk_bytes[i * 4],
-            chunk_bytes[i * 4 + 1],
-            chunk_bytes[i * 4 + 2],
-            chunk_bytes[i * 4 + 3],
-        ];
-        floats[i] = f32::from_le_bytes(bytes);
-    }
-
-    // Now you have your 512 floats in the 'floats' array
-    println!("First few floats: {:?}", &floats[..5]);
-    println!("Last few floats: {:?}", &floats[507..]);
-
-    // Process your floats here
-    // For example, calculate statistics, apply algorithms, etc.
 }
