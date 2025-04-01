@@ -1,7 +1,7 @@
 # SPI Slave Example for ESP32
 
 ## Overview
-This project demonstrates how to use an ESP32 as an SPI slave device with DMA (Direct Memory Access). It receives data from an SPI master device and makes it available asynchronously in a ring buffer using Embassy and no_std environment.
+This project demonstrates how to use an ESP32 as an SPI slave device with DMA (Direct Memory Access). It asynchronously receives data from an SPI master device and stores it in a ring buffer, leveraging the Embassy framework in a `no_std` environment. Refer to the SPI master repository for more instructions on running the example test provided in the source code.
 
 ## Features
 - SPI slave implementation with DMA buffer, receives chunks with `CHUNK_SIZE` batches of data each time.
