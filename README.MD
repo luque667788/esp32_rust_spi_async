@@ -63,7 +63,7 @@ Remember to change to your specific ESP32 version in the `Cargo.toml` file and c
 - The CS pin is manually controlled by the master and is triggered per chunk of data sent.
 - Fixed buffer sizes must be set at compile time, and the DMA buffer must be a multiple of 4 bytes and the same size as the master `CHUNK_SIZE`.
 - Requires ESP32 HAL with unstable features.
-- Not the most ideal solution due to limitations in the esp-hal, such as the inability to handle DMA interrupts or use the provided DMA circular buffer due to bugs and other issues in the HAL. The ESP-HAL crate is unfortunately not very developed in this area, and it would be out of the gig scope to make my custom version of the HAL with all the necessary features.
+- Not the most ideal solution due to limitations in the esp-hal, such as the inability to handle DMA interrupts or use the provided DMA circular buffer due to bugs and other issues in the HAL. The ESP-HAL crate is unfortunately not very developed in this area, and it would be out of the project scope to make my custom version of the HAL with all the necessary features.
 
 ## Troubleshooting
 If you encounter issues:
@@ -74,6 +74,4 @@ If you encounter issues:
 - Verify that master and slave use compatible SPI modes and the same `CHUNK_SIZE`, and that the `CHUNK_SIZE` is a multiple of 4 bytes.
 
 
-See the source code comments and the master implementation docs for more information.
-
-Feel free to contact me if you have any issues, doubts, or questions!
+See the source code comments and the corresponding master implementation docs for more information.
